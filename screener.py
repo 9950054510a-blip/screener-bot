@@ -14,13 +14,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Токен бота
+# Токен бота из переменных окружения
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 if not TELEGRAM_BOT_TOKEN:
-  logger.error(
-      "TELEGRAM_BOT_TOKEN не найден в переменных окружения! Завершение"
-      " работы."
-  )
+  logger.error("TELEGRAM_BOT_TOKEN не найден в переменных окружения!")
   sys.exit(1)
 
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
@@ -113,10 +110,8 @@ def calculate_quality_score(
     vol_ratio: float, rsi_15m: float, distance_ema: float, direction: str
 ) -> float:
   """Считает Quality Score (0 - 100) без будущих данных."""
-  # 1. S_vol (Объем) - вес 0.40
   s_vol = min(100.0, vol_ratio * 50.0)
 
-  # 2. S_rsi - вес 0.30
   if direction == "LONG":
     target_rsi = 41.5
     s_rsi = max(0.0, 100.0 - (abs(rsi_15m - target_rsi) / 6.5) * 100.0)
@@ -124,7 +119,6 @@ def calculate_quality_score(
     target_rsi = 58.5
     s_rsi = max(0.0, 100.0 - (abs(rsi_15m - target_rsi) / 6.5) * 100.0)
 
-  # 3. S_trend - вес 0.30
   s_trend = min(100.0, distance_ema * 20.0)
 
   score = (0.40 * s_vol) + (0.30 * s_rsi) + (0.30 * s_trend)
@@ -135,7 +129,7 @@ def calculate_quality_score(
 # 3. ПОЛУЧЕНИЕ ДАННЫХ С BINANCE FUTURES
 # ==========================================
 async def get_trading_pairs(session: ClientSession) -> list:
-  """Получает парф USDT-M с quoteVolume >= 15M."""
+  """Получает пары USDT-M с quoteVolume >= 15M."""
   url = f"{BINANCE_BASE_URL}/fapi/v1/ticker/24hr"
   async with session.get(url) as resp:
     if resp.status != 200:
@@ -163,7 +157,7 @@ async def fetch_klines(
 
 
 async def analyze_symbol(session: ClientSession, symbol: str, btc_trend: str):
-  """Анализирует инструмент по каноническим правилам."""
+  """Анализирует инструмент по фильтрам Trend-Pullback."""
   try:
     klines_1h = await fetch_klines(session, symbol, "1h", 210)
     klines_15m = await fetch_klines(session, symbol, "15m", 60)
@@ -332,7 +326,7 @@ async def run_market_scan() -> tuple:
 # 4. TELEGRAM БОТ ОБРАБОТЧИКИ
 # ==========================================
 def get_scan_keyboard():
-  """Инлайн-кнопка для запуска сканера."""
+  """Инлайн-кнопка под сообщением."""
   keyboard = InlineKeyboardMarkup(
       inline_keyboard=[[
           InlineKeyboardButton(
@@ -346,14 +340,23 @@ def get_scan_keyboard():
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
   await message.answer(
-      "👋 Привет! Я cuantitativo скринер Binance USDT-M Futures.\n\n"
-      "Нажмите кнопку ниже или отправьте /scan для поиска сетапов Trend-Pullback.",
+      "👋 Привет! Я quantitative скринер Binance USDT-M Futures.\n\n"
+      "Нажмите кнопку ниже или отправьте /scan для поиска сетапов"
+      " Trend-Pullback.",
       reply_markup=get_scan_keyboard(),
   )
 
 
-@dp.message(Command("scan"))
-async def cmd_scan(message: types.Message):
+# Принимает команду /scan И ЛЮБЫЕ варианты текста с кнопок (включая Reply Keyboard)
+@dp.message(
+    lambda m: m.text
+    and (
+        m.text.startswith("/scan")
+        or "сканер" in m.text.lower()
+        or "сканирование" in m.text.lower()
+    )
+)
+async def cmd_scan_text(message: types.Message):
   await execute_scan_and_send(message.chat.id)
 
 
@@ -418,10 +421,7 @@ async def execute_scan_and_send(chat_id: int):
 # 5. ТОЧКА ВХОДА (MAIN)
 # ==========================================
 async def main():
-  # 1. Запускаем фоновый HTTP-сервер для Render (Health Check)
   await start_health_check_server()
-
-  # 2. Удаляем вебок и запускаем long polling бота
   await bot.delete_webhook(drop_pending_updates=True)
   logger.info("Бот успешно запущен в режиме Long Polling!")
   await dp.start_polling(bot)
