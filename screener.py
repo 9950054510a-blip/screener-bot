@@ -1,431 +1,362 @@
 import asyncio
 import logging
-import math
 import os
-import sys
-from aiohttp import ClientSession, web
+import time
+import aiohttp
+from aiohttp import web
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery
 
-# Настройка логирования
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-# Токен бота из переменных окружения
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-if not TELEGRAM_BOT_TOKEN:
-  logger.error("TELEGRAM_BOT_TOKEN не найден в переменных окружения!")
-  sys.exit(1)
+CHAT_ID = os.getenv("CHAT_ID")
 
-bot = Bot(token=TELEGRAM_BOT_TOKEN)
+if not TELEGRAM_BOT_TOKEN:
+    logger.error("TELEGRAM_BOT_TOKEN не найден в переменных окружения!")
+
+bot = Bot(token=TELEGRAM_BOT_TOKEN) if TELEGRAM_BOT_TOKEN else None
 dp = Dispatcher()
 
 BINANCE_BASE_URL = "https://fapi.binance.com"
+
+SENT_SIGNALS_CACHE = {}
+CACHE_TTL = 2 * 3600  # 2 часа задержка перед повторным сигналом по той же монете
 
 
 # ==========================================
 # 1. HEALTH CHECK СЕРВЕР ДЛЯ RENDER
 # ==========================================
 async def handle_health(request):
-  """Возвращает 200 OK для проверки жизнеспособности сервиса в Render."""
-  return web.Response(text="OK", status=200)
-
+    return web.Response(text="OK", status=200)
 
 async def start_health_check_server():
-  """Запускает фоновый HTTP-сервер на порту, переданном Render (PORT)."""
-  app = web.Application()
-  app.router.add_get("/", handle_health)
-  app.router.add_get("/health", handle_health)
-
-  runner = web.AppRunner(app)
-  await runner.setup()
-
-  port = int(os.environ.get("PORT", 8080))
-  site = web.TCPSite(runner, "0.0.0.0", port)
-  await site.start()
-  logger.info(f"Health check HTTP server успешно запущен на порту {port}")
+    app = web.Application()
+    app.router.add_get("/", handle_health)
+    app.router.add_get("/health", handle_health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.environ.get("PORT", 8080))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logger.info(f"Health check HTTP server успешно запущен на порту {port}")
 
 
 # ==========================================
-# 2. РАСЧЕТ ИНДИКАТОРОВ И QUALITY SCORE
+# 2. РАСЧЕТ ИНДИКАТОРОВ
 # ==========================================
-def calculate_ema(prices: list, period: int) -> float:
-  """Считает EMA для списка цен."""
-  if len(prices) < period:
-    return prices[-1] if prices else 0.0
-  alpha = 2 / (period + 1)
-  ema = sum(prices[:period]) / period
-  for price in prices[period:]:
-    ema = (price * alpha) + (ema * (1 - alpha))
-  return ema
+def calculate_ema(prices, period):
+    if len(prices) < period:
+        return prices[-1] if prices else 0
+    k = 2 / (period + 1)
+    ema = prices[0]
+    for price in prices[1:]:
+        ema = price * k + ema * (1 - k)
+    return ema
 
+def calculate_rsi(prices, period=14):
+    if len(prices) < period + 1:
+        return 50
+    gains, losses = [], []
+    for i in range(1, len(prices)):
+        change = prices[i] - prices[i - 1]
+        if change >= 0:
+            gains.append(change)
+            losses.append(0)
+        else:
+            gains.append(0)
+            losses.append(abs(change))
+    
+    avg_gain = sum(gains[-period:]) / period
+    avg_loss = sum(losses[-period:]) / period
+    
+    if avg_loss == 0:
+        return 100
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
 
-def calculate_atr(highs: list, lows: list, closes: list, period: int = 14) -> float:
-  """Считает ATR14."""
-  if len(closes) <= period:
-    return (highs[-1] - lows[-1]) if highs else 0.0
-  tr_list = []
-  for i in range(1, len(closes)):
-    tr = max(
-        highs[i] - lows[i],
-        abs(highs[i] - closes[i - 1]),
-        abs(lows[i] - closes[i - 1]),
-    )
-    tr_list.append(tr)
-  return sum(tr_list[-period:]) / period
-
-
-def calculate_rsi(closes: list, period: int = 14) -> float:
-  """Считает RSI14."""
-  if len(closes) <= period:
-    return 50.0
-  gains, losses = 0.0, 0.0
-  for i in range(1, period + 1):
-    diff = closes[i] - closes[i - 1]
-    if diff >= 0:
-      gains += diff
-    else:
-      losses += abs(diff)
-
-  avg_gain = gains / period
-  avg_loss = losses / period
-
-  for i in range(period + 1, len(closes)):
-    diff = closes[i] - closes[i - 1]
-    gain = diff if diff > 0 else 0.0
-    loss = abs(diff) if diff < 0 else 0.0
-    avg_gain = (avg_gain * (period - 1) + gain) / period
-    avg_loss = (avg_loss * (period - 1) + loss) / period
-
-  if avg_loss == 0:
-    return 100.0
-  rs = avg_gain / avg_loss
-  return 100.0 - (100.0 / (1.0 + rs))
-
-
-def calculate_quality_score(
-    vol_ratio: float, rsi_15m: float, distance_ema: float, direction: str
-) -> float:
-  """Считает Quality Score (0 - 100) без будущих данных."""
-  s_vol = min(100.0, vol_ratio * 50.0)
-
-  if direction == "LONG":
-    target_rsi = 41.5
-    s_rsi = max(0.0, 100.0 - (abs(rsi_15m - target_rsi) / 6.5) * 100.0)
-  else:
-    target_rsi = 58.5
-    s_rsi = max(0.0, 100.0 - (abs(rsi_15m - target_rsi) / 6.5) * 100.0)
-
-  s_trend = min(100.0, distance_ema * 20.0)
-
-  score = (0.40 * s_vol) + (0.30 * s_rsi) + (0.30 * s_trend)
-  return round(score, 1)
+def calculate_atr(klines, period=14):
+    if len(klines) < period + 1:
+        return 0
+    trs = []
+    for i in range(1, len(klines)):
+        high = float(klines[i][2])
+        low = float(klines[i][3])
+        prev_close = float(klines[i - 1][4])
+        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+        trs.append(tr)
+    return sum(trs[-period:]) / period if trs else 0
 
 
 # ==========================================
-# 3. ПОЛУЧЕНИЕ ДАННЫХ С BINANCE FUTURES
+# 3. ПОЛУЧЕНИЕ ДАННЫХ И АНАЛИЗ
 # ==========================================
-async def get_trading_pairs(session: ClientSession) -> list:
-  """Получает пары USDT-M с quoteVolume >= 15M."""
-  url = f"{BINANCE_BASE_URL}/fapi/v1/ticker/24hr"
-  async with session.get(url) as resp:
-    if resp.status != 200:
-      return []
-    tickers = await resp.json()
+async def fetch_klines(session, symbol, interval, limit=100):
+    url = f"{BINANCE_BASE_URL}/fapi/v1/klines"
+    params = {"symbol": symbol, "interval": interval, "limit": limit}
+    try:
+        async with session.get(url, params=params, timeout=10) as resp:
+            if resp.status == 200:
+                return await resp.json()
+    except Exception as e:
+        logger.error(f"Ошибка получения klines для {symbol} ({interval}): {e}")
+    return None
 
-  valid_pairs = []
-  for t in tickers:
-    symbol = t.get("symbol", "")
-    quote_volume = float(t.get("quoteVolume", 0))
-    if symbol.endswith("USDT") and quote_volume >= 15_000_000:
-      valid_pairs.append(symbol)
-  return valid_pairs
+async def get_futures_symbols(session):
+    url = f"{BINANCE_BASE_URL}/fapi/v1/ticker/24hr"
+    try:
+        async with session.get(url, timeout=10) as resp:
+            if resp.status == 200:
+                tickers = await resp.json()
+                symbols = [
+                    t["symbol"] for t in tickers 
+                    if t["symbol"].endswith("USDT") and float(t.get("quoteVolume", 0)) >= 15_000_000
+                ]
+                return symbols
+    except Exception as e:
+        logger.error(f"Ошибка получения тикеров: {e}")
+    return []
 
-
-async def fetch_klines(
-    session: ClientSession, symbol: str, interval: str, limit: int
-) -> list:
-  """Запрашивает свечи с Binance."""
-  url = f"{BINANCE_BASE_URL}/fapi/v1/klines?symbol={symbol}&interval={interval}&limit={limit}"
-  async with session.get(url) as resp:
-    if resp.status != 200:
-      return []
-    return await resp.json()
-
-
-async def analyze_symbol(session: ClientSession, symbol: str, btc_trend: str):
-  """Анализирует инструмент по фильтрам Trend-Pullback."""
-  try:
+async def analyze_symbol(session, symbol, btc_trend):
     klines_1h = await fetch_klines(session, symbol, "1h", 210)
     klines_15m = await fetch_klines(session, symbol, "15m", 60)
     klines_5m = await fetch_klines(session, symbol, "5m", 30)
 
-    if (
-        len(klines_1h) < 205
-        or len(klines_15m) < 20
-        or len(klines_5m) < 22
-    ):
-      return None
+    if not klines_1h or not klines_15m or not klines_5m:
+        return None
 
-    # Закрытые свечи 1H
     closes_1h = [float(k[4]) for k in klines_1h[:-1]]
-    ema20_1h = calculate_ema(closes_1h, 20)
-    ema50_1h = calculate_ema(closes_1h, 50)
-    ema200_1h = calculate_ema(closes_1h, 200)
-    last_close_1h = closes_1h[-1]
-
-    coin_long = (ema20_1h > ema50_1h) and (last_close_1h > ema200_1h)
-    coin_short = (ema20_1h < ema50_1h) and (last_close_1h < ema200_1h)
-
-    # Закрытые свечи 15M (m-1, m-2, m-3)
     closes_15m = [float(k[4]) for k in klines_15m[:-1]]
-    highs_15m = [float(k[2]) for k in klines_15m[:-1]]
-    lows_15m = [float(k[3]) for k in klines_15m[:-1]]
+    closes_5m = [float(k[4]) for k in klines_5m[:-1]]
+    vols_15m = [float(k[5]) for k in klines_15m[:-1]]
 
+    current_price = float(klines_5m[-1][4])
+
+    ema200_1h = calculate_ema(closes_1h, 200)
     ema20_15m = calculate_ema(closes_15m, 20)
     ema50_15m = calculate_ema(closes_15m, 50)
-    zone_min_15m = min(ema20_15m, ema50_15m)
-    zone_max_15m = max(ema20_15m, ema50_15m)
+    ema20_5m = calculate_ema(closes_5m, 20)
 
-    atr14_15m = calculate_atr(highs_15m, lows_15m, closes_15m, 14)
-    rsi14_15m = calculate_rsi(closes_15m, 14)
+    rsi_15m = calculate_rsi(closes_15m, 14)
+    atr_15m = calculate_atr(klines_15m, 14)
 
-    # 15m Touch, Depth, Hold
-    lows_3bars_15m = min(lows_15m[-3:])
-    highs_3bars_15m = max(highs_15m[-3:])
+    avg_vol_15m = sum(vols_15m[-20:]) / 20 if len(vols_15m) >= 20 else 1
+    current_vol_15m = vols_15m[-1] if vols_15m else 0
+    vol_ratio = current_vol_15m / avg_vol_15m if avg_vol_15m > 0 else 1.0
 
-    long_touch = lows_3bars_15m <= zone_max_15m
-    long_wick_depth = lows_3bars_15m >= (zone_min_15m - (0.3 * atr14_15m))
-    long_hold = closes_15m[-1] > zone_min_15m
-    rsi_long_ok = 35.0 <= rsi14_15m <= 48.0
+    score = 50
+    direction = None
 
-    short_touch = highs_3bars_15m >= zone_min_15m
-    short_wick_depth = highs_3bars_15m <= (zone_max_15m + (0.3 * atr14_15m))
-    short_hold = closes_15m[-1] < zone_max_15m
-    rsi_short_ok = 52.0 <= rsi14_15m <= 65.0
+    if btc_trend == "LONG":
+        if closes_1h[-1] > ema200_1h:
+            score += 15
+        else:
+            return None
 
-    # Закрытые свечи 5M
-    closes_5m = [float(k[4]) for k in klines_5m[:-1]]
-    highs_5m = [float(k[2]) for k in klines_5m[:-1]]
-    lows_5m = [float(k[3]) for k in klines_5m[:-1]]
-    volumes_5m = [float(k[5]) for k in klines_5m[:-1]]
+        if ema20_15m > ema50_15m:
+            score += 10
+        dist_to_ema20 = abs(current_price - ema20_15m) / current_price
+        if dist_to_ema20 <= 0.008:
+            score += 15
 
-    # Breakout 5m (t-1 пробивает t-2..t-4)
-    breakout_long = closes_5m[-1] > max(highs_5m[-4:-1])
-    breakout_short = closes_5m[-1] < min(lows_5m[-4:-1])
+        if closes_5m[-1] > ema20_5m:
+            score += 10
 
-    # Volume 5m (t-1 > SMA20 на t-2..t-21)
-    vol_ref = sum(volumes_5m[-21:-1]) / 20.0
-    vol_ratio = volumes_5m[-1] / vol_ref if vol_ref > 0 else 0.0
-    vol_cond = vol_ratio > 1.0
+        if 40 <= rsi_15m <= 65:
+            score += 10
 
-    highs_1h = [float(k[2]) for k in klines_1h[:-1]]
-    lows_1h = [float(k[3]) for k in klines_1h[:-1]]
-    atr14_1h = calculate_atr(highs_1h, lows_1h, closes_1h, 14)
-    dist_ema = (
-        abs(last_close_1h - ema200_1h) / atr14_1h if atr14_1h > 0 else 1.0
+        if vol_ratio >= 1.3:
+            score += 10
+
+        if score >= 70:
+            direction = "LONG"
+            stop_loss = current_price - (1.5 * atr_15m)
+            take_profit = current_price + (3.0 * atr_15m)
+
+    elif btc_trend == "SHORT":
+        if closes_1h[-1] < ema200_1h:
+            score += 15
+        else:
+            return None
+
+        if ema20_15m < ema50_15m:
+            score += 10
+        dist_to_ema20 = abs(current_price - ema20_15m) / current_price
+        if dist_to_ema20 <= 0.008:
+            score += 15
+
+        if closes_5m[-1] < ema20_5m:
+            score += 10
+
+        if 35 <= rsi_15m <= 60:
+            score += 10
+
+        if vol_ratio >= 1.3:
+            score += 10
+
+        if score >= 70:
+            direction = "SHORT"
+            stop_loss = current_price + (1.5 * atr_15m)
+            take_profit = current_price - (3.0 * atr_15m)
+
+    if direction:
+        return {
+            "symbol": symbol,
+            "direction": direction,
+            "score": score,
+            "price": current_price,
+            "rsi": round(rsi_15m, 1),
+            "vol_ratio": round(vol_ratio, 2),
+            "stop_loss": round(stop_loss, 4),
+            "take_profit": round(take_profit, 4)
+        }
+
+    return None
+
+async def run_market_scan():
+    async with aiohttp.ClientSession() as session:
+        btc_klines = await fetch_klines(session, "BTCUSDT", "1h", 210)
+        if not btc_klines:
+            logger.error("Не удалось получить Klines для BTCUSDT")
+            return [], []
+
+        btc_closes = [float(k[4]) for k in btc_klines[:-1]]
+        btc_ema200 = calculate_ema(btc_closes, 200)
+        btc_trend = "LONG" if btc_closes[-1] > btc_ema200 else "SHORT"
+
+        symbols = await get_futures_symbols(session)
+        if not symbols:
+            return [], []
+
+        tasks = [analyze_symbol(session, sym, btc_trend) for sym in symbols]
+        results = await asyncio.gather(*tasks)
+
+        longs = [r for r in results if r and r["direction"] == "LONG"]
+        shorts = [r for r in results if r and r["direction"] == "SHORT"]
+
+        longs.sort(key=lambda x: x["score"], reverse=True)
+        shorts.sort(key=lambda x: x["score"], reverse=True)
+
+        return longs, shorts
+
+
+# ==========================================
+# 4. ФОРМАТИРОВАНИЕ СООБЩЕНИЙ И ОБРАБОТЧИКИ
+# ==========================================
+def format_signal_message(longs, shorts):
+    if not longs and not shorts:
+        return "❌ Качественных сетапов с Quality Score >= 70 на данный момент не найдено."
+
+    text = "📊 *РЕЗУЛЬТАТЫ СКАНРИРОВАНИЯ (TREND-PULLBACK)*\n\n"
+
+    if longs:
+        text += f"🟢 *TOP-{len(longs)} LONG СЕТАПЫ:*\n"
+        for s in longs[:5]:
+            text += (
+                f"• *{s['symbol']}* | Score: *{s['score']}*\n"
+                f"  Вход: `{s['price']}` | SL: `{s['stop_loss']}` | TP: `{s['take_profit']}`\n"
+                f"  Vol Ratio: `{s['vol_ratio']}x` | RSI: `{s['rsi']}`\n\n"
+            )
+
+    if shorts:
+        text += f"🔴 *TOP-{len(shorts)} SHORT СЕТАПЫ:*\n"
+        for s in shorts[:5]:
+            text += (
+                f"• *{s['symbol']}* | Score: *{s['score']}*\n"
+                f"  Вход: `{s['price']}` | SL: `{s['stop_loss']}` | TP: `{s['take_profit']}`\n"
+                f"  Vol Ratio: `{s['vol_ratio']}x` | RSI: `{s['rsi']}`\n\n"
+            )
+
+    return text
+
+def get_scan_keyboard():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔍 Запустить сканер", callback_data="run_scan")]
+        ]
     )
 
-    entry_price = closes_5m[-1]
+async def auto_scan_job():
+    """Фоновая задача: авто-сканирование каждые 15 минут."""
+    while True:
+        try:
+            await asyncio.sleep(900)  # 15 минут
+            logger.info("⏰ Запуск автоматического 15-минутного сканирования...")
+            longs, shorts = await run_market_scan()
 
-    # Валидация LONG
-    if (
-        btc_trend == "LONG"
-        and coin_long
-        and long_touch
-        and long_wick_depth
-        and long_hold
-        and rsi_long_ok
-        and breakout_long
-        and vol_cond
-    ):
-      score = calculate_quality_score(vol_ratio, rsi14_15m, dist_ema, "LONG")
-      sl = entry_price - (1.5 * atr14_15m)
-      tp1 = entry_price + (3.0 * atr14_15m)
-      tp2 = entry_price + (4.5 * atr14_15m)
-      tp3 = entry_price + (6.0 * atr14_15m)
-      return {
-          "symbol": symbol,
-          "direction": "LONG",
-          "score": score,
-          "entry": entry_price,
-          "sl": sl,
-          "tp1": tp1,
-          "tp2": tp2,
-          "tp3": tp3,
-          "vol_ratio": round(vol_ratio, 2),
-          "rsi": round(rsi14_15m, 1),
-      }
+            now = time.time()
+            for sym, ts in list(SENT_SIGNALS_CACHE.items()):
+                if now - ts > CACHE_TTL:
+                    del SENT_SIGNALS_CACHE[sym]
 
-    # Валидация SHORT
-    if (
-        btc_trend == "SHORT"
-        and coin_short
-        and short_touch
-        and short_wick_depth
-        and short_hold
-        and rsi_short_ok
-        and breakout_short
-        and vol_cond
-    ):
-      score = calculate_quality_score(vol_ratio, rsi14_15m, dist_ema, "SHORT")
-      sl = entry_price + (1.5 * atr14_15m)
-      tp1 = entry_price - (3.0 * atr14_15m)
-      tp2 = entry_price - (4.5 * atr14_15m)
-      tp3 = entry_price - (6.0 * atr14_15m)
-      return {
-          "symbol": symbol,
-          "direction": "SHORT",
-          "score": score,
-          "entry": entry_price,
-          "sl": sl,
-          "tp1": tp1,
-          "tp2": tp2,
-          "tp3": tp3,
-          "vol_ratio": round(vol_ratio, 2),
-          "rsi": round(rsi14_15m, 1),
-      }
+            new_longs = [s for s in longs if s["symbol"] not in SENT_SIGNALS_CACHE]
+            new_shorts = [s for s in shorts if s["symbol"] not in SENT_SIGNALS_CACHE]
 
-  except Exception as e:
-    logger.error(f"Ошибка анализа {symbol}: {e}")
-  return None
+            if (new_longs or new_shorts) and CHAT_ID:
+                msg_text = "🚨 *АВТО-СИГНАЛ СКРИНЕРА (15M)* 🚨\n\n" + format_signal_message(new_longs, new_shorts)
+                await bot.send_message(chat_id=CHAT_ID, text=msg_text, parse_mode="Markdown", reply_markup=get_scan_keyboard())
+                
+                for s in new_longs + new_shorts:
+                    SENT_SIGNALS_CACHE[s["symbol"]] = now
 
-
-async def run_market_scan() -> tuple:
-  """Сканирует рынок Binance Futures и формирует выборки."""
-  async with ClientSession() as session:
-    # 1. Тренд BTC 1H
-    btc_klines = await fetch_klines(session, "BTCUSDT", "1h", 210)
-    if len(btc_klines) < 205:
-      return [], []
-    btc_closes = [float(k[4]) for k in btc_klines[:-1]]
-    btc_ema200 = calculate_ema(btc_closes, 200)
-    btc_trend = "LONG" if btc_closes[-1] > btc_ema200 else "SHORT"
-
-    # 2. Получение пар
-    pairs = await get_trading_pairs(session)
-
-    # 3. Анализ монет
-    tasks = [analyze_symbol(session, pair, btc_trend) for pair in pairs]
-    results = await asyncio.gather(*tasks)
-
-    longs = [r for r in results if r and r["direction"] == "LONG"]
-    shorts = [r for r in results if r and r["direction"] == "SHORT"]
-
-    # 4. Ранжирование по Quality Score
-    longs.sort(key=lambda x: x["score"], reverse=True)
-    shorts.sort(key=lambda x: x["score"], reverse=True)
-
-    return longs[:10], shorts[:10]
-
-
-# ==========================================
-# 4. TELEGRAM БОТ ОБРАБОТЧИКИ
-# ==========================================
-def get_scan_keyboard():
-  """Инлайн-кнопка под сообщением."""
-  keyboard = InlineKeyboardMarkup(
-      inline_keyboard=[[
-          InlineKeyboardButton(
-              text="🔍 Запустить сканирование", callback_data="run_scan"
-          )
-      ]]
-  )
-  return keyboard
-
+        except Exception as e:
+            logger.error(f"Ошибка в авто-сканировании: {e}")
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
-  await message.answer(
-      "👋 Привет! Я quantitative скринер Binance USDT-M Futures.\n\n"
-      "Нажмите кнопку ниже или отправьте /scan для поиска сетапов"
-      " Trend-Pullback.",
-      reply_markup=get_scan_keyboard(),
-  )
-
-
-# Принимает команду /scan И ЛЮБЫЕ варианты текста с кнопок (включая Reply Keyboard)
-@dp.message(
-    lambda m: m.text
-    and (
-        m.text.startswith("/scan")
-        or "сканер" in m.text.lower()
-        or "сканирование" in m.text.lower()
+    global CHAT_ID
+    CHAT_ID = message.chat.id
+    await message.answer(
+        "👋 Привет! Я торговый скринер Binance Futures.\n\n"
+        "Я автоматически сканирую рынок каждые 15 минут и присылаю сигналы при появлении качественных сетапов.\n"
+        "Вы также можете запустить сканирование вручную:",
+        reply_markup=get_scan_keyboard()
     )
-)
-async def cmd_scan_text(message: types.Message):
-  await execute_scan_and_send(message.chat.id)
 
+@dp.message(lambda m: m.text and ("сканер" in m.text.lower() or "сканирование" in m.text.lower() or m.text.startswith("/scan")))
+async def cmd_scan_text(message: types.Message):
+    global CHAT_ID
+    CHAT_ID = message.chat.id
+    await execute_scan_and_send(message.chat.id)
 
 @dp.callback_query(lambda c: c.data == "run_scan")
-async def callback_scan(callback_query: types.CallbackQuery):
-  await callback_query.answer("Запуск сканирования рынка...")
-  await execute_scan_and_send(callback_query.message.chat.id)
-
+async def callback_scan(callback_query: CallbackQuery):
+    global CHAT_ID
+    CHAT_ID = callback_query.message.chat.id
+    await callback_query.answer("Запуск сканирования рынка...")
+    await execute_scan_and_send(callback_query.message.chat.id)
 
 async def execute_scan_and_send(chat_id: int):
-  status_msg = await bot.send_message(
-      chat_id, "⏳ Сканирую рынки Binance USDT-M Futures (1H / 15M / 5M)..."
-  )
+    status_msg = await bot.send_message(chat_id, "⏳ Сканирую рынки Binance USDT-M Futures (1H / 15M / 5M)...")
+    longs, shorts = await run_market_scan()
+    report = format_signal_message(longs, shorts)
 
-  longs, shorts = await run_market_scan()
-
-  if not longs and not shorts:
     await bot.edit_message_text(
-        "❌ Качественных сетапов не найдено. Фильтры строго выдержаны.",
+        report,
         chat_id=chat_id,
         message_id=status_msg.message_id,
-        reply_markup=get_scan_keyboard(),
+        parse_mode="Markdown",
+        reply_markup=get_scan_keyboard()
     )
-    return
-
-  report = "📊 **РЕЗУЛЬТАТЫ СКАННРОВАНИЯ (TREND-PULLBACK)**\n\n"
-
-  if longs:
-    report += f"🟢 **TOP-{len(longs)} LONG СЕТАПЫ:**\n"
-    for item in longs:
-      report += (
-          f"• **{item['symbol']}** | Score: **{item['score']}**\n"
-          f"  Вход: `{item['entry']}` | SL: `{item['sl']:.4f}`\n"
-          f"  TP1: `{item['tp1']:.4f}` | TP2: `{item['tp2']:.4f}` | TP3:"
-          f" `{item['tp3']:.4f}`\n"
-          f"  Vol Ratio: {item['vol_ratio']}x | RSI: {item['rsi']}\n\n"
-      )
-
-  if shorts:
-    report += f"🔴 **TOP-{len(shorts)} SHORT СЕТАПЫ:**\n"
-    for item in shorts:
-      report += (
-          f"• **{item['symbol']}** | Score: **{item['score']}**\n"
-          f"  Вход: `{item['entry']}` | SL: `{item['sl']:.4f}`\n"
-          f"  TP1: `{item['tp1']:.4f}` | TP2: `{item['tp2']:.4f}` | TP3:"
-          f" `{item['tp3']:.4f}`\n"
-          f"  Vol Ratio: {item['vol_ratio']}x | RSI: {item['rsi']}\n\n"
-      )
-
-  report += "⚠️ *Исполнение ордеров отключено (Screener-only).* "
-
-  await bot.edit_message_text(
-      report,
-      chat_id=chat_id,
-      message_id=status_msg.message_id,
-      parse_mode="Markdown",
-      reply_markup=get_scan_keyboard(),
-  )
 
 
 # ==========================================
 # 5. ТОЧКА ВХОДА (MAIN)
 # ==========================================
 async def main():
-  await start_health_check_server()
-  await bot.delete_webhook(drop_pending_updates=True)
-  logger.info("Бот успешно запущен в режиме Long Polling!")
-  await dp.start_polling(bot)
-
+    if not bot:
+        logger.error("Бот не инициализирован. Проверьте TELEGRAM_BOT_TOKEN.")
+        return
+    
+    await start_health_check_server()
+    await bot.delete_webhook(drop_pending_updates=True)
+    
+    asyncio.create_task(auto_scan_job())
+    
+    logger.info("🤖 Бот запущен с функцией 15-минутного авто-сканирования!")
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
-  asyncio.run(main())
+    asyncio.run(main())
