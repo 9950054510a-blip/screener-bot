@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import time
+from datetime import datetime
 import aiohttp
 from aiohttp import web
 from aiogram import Bot, Dispatcher, types
@@ -23,9 +24,8 @@ dp = Dispatcher()
 BINANCE_BASE_URL = "https://fapi.binance.com"
 
 SENT_SIGNALS_CACHE = {}
-CACHE_TTL = 2 * 3600  # 2 часа задержка перед повторным сигналом
+CACHE_TTL = 2 * 3600  # 2 часа задержка перед повторным сигналом по той же монете
 
-# Переменная состояния авто-сканера (по умолчанию включен)
 AUTO_SCAN_ENABLED = True
 
 
@@ -48,7 +48,7 @@ async def start_health_check_server():
 
 
 # ==========================================
-# 2. РАСЧЕТ ИНДИКАТОРОВ
+# 2. РАСЧЕТ ИНДИКАТОРОВ И МЕТРИК
 # ==========================================
 def calculate_ema(prices, period):
     if len(prices) < period:
@@ -94,7 +94,7 @@ def calculate_atr(klines, period=14):
 
 
 # ==========================================
-# 3. ПОЛУЧЕНИЕ ДАННЫХ И АНАЛИЗ
+# 3. ПОЛУЧЕНИЕ ДАННЫХ И АНАЛИЗ (NEXUS ENGINE)
 # ==========================================
 async def fetch_klines(session, symbol, interval, limit=100):
     url = f"{BINANCE_BASE_URL}/fapi/v1/klines"
@@ -137,6 +137,7 @@ async def analyze_symbol(session, symbol, btc_trend):
 
     current_price = float(klines_5m[-1][4])
 
+    # Индикаторы
     ema200_1h = calculate_ema(closes_1h, 200)
     ema20_15m = calculate_ema(closes_15m, 20)
     ema50_15m = calculate_ema(closes_15m, 50)
@@ -145,6 +146,13 @@ async def analyze_symbol(session, symbol, btc_trend):
     rsi_15m = calculate_rsi(closes_15m, 14)
     atr_15m = calculate_atr(klines_15m, 14)
 
+    # Объем и Taker Buy Ratio последнего 5M бара
+    last_5m = klines_5m[-2] # Завершенная свеча
+    vol_5m = float(last_5m[5])
+    taker_buy_vol_5m = float(last_5m[9]) # Taker buy base asset volume
+    taker_buy_ratio = round(taker_buy_vol_5m / vol_5m, 2) if vol_5m > 0 else 0.50
+
+    # Относительный объем 15M
     avg_vol_15m = sum(vols_15m[-20:]) / 20 if len(vols_15m) >= 20 else 1
     current_vol_15m = vols_15m[-1] if vols_15m else 0
     vol_ratio = current_vol_15m / avg_vol_15m if avg_vol_15m > 0 else 1.0
@@ -153,23 +161,32 @@ async def analyze_symbol(session, symbol, btc_trend):
     direction = None
 
     if btc_trend == "LONG":
+        # 1. Тренд 1H
         if closes_1h[-1] > ema200_1h:
             score += 15
         else:
             return None
 
+        # 2. Локальная структура 15M (Замечание ChatGPT & Claude)
         if ema20_15m > ema50_15m:
             score += 10
+        else:
+            return None # Жесткий фильтр структуры
+
+        # 3. Близость к откату
         dist_to_ema20 = abs(current_price - ema20_15m) / current_price
         if dist_to_ema20 <= 0.008:
             score += 15
 
+        # 4. Подтверждение 5M
         if closes_5m[-1] > ema20_5m:
             score += 10
 
+        # 5. RSI 15M
         if 40 <= rsi_15m <= 65:
             score += 10
 
+        # 6. Объем
         if vol_ratio >= 1.3:
             score += 10
 
@@ -179,23 +196,32 @@ async def analyze_symbol(session, symbol, btc_trend):
             take_profit = current_price + (3.0 * atr_15m)
 
     elif btc_trend == "SHORT":
+        # 1. Тренд 1H
         if closes_1h[-1] < ema200_1h:
             score += 15
         else:
             return None
 
+        # 2. Локальная структура 15M (Замечание ChatGPT & Claude)
         if ema20_15m < ema50_15m:
             score += 10
+        else:
+            return None # Жесткий фильтр структуры
+
+        # 3. Близость к откату
         dist_to_ema20 = abs(current_price - ema20_15m) / current_price
         if dist_to_ema20 <= 0.008:
             score += 15
 
+        # 4. Подтверждение 5M
         if closes_5m[-1] < ema20_5m:
             score += 10
 
+        # 5. RSI 15M
         if 35 <= rsi_15m <= 60:
             score += 10
 
+        # 6. Объем
         if vol_ratio >= 1.3:
             score += 10
 
@@ -212,6 +238,7 @@ async def analyze_symbol(session, symbol, btc_trend):
             "price": current_price,
             "rsi": round(rsi_15m, 1),
             "vol_ratio": round(vol_ratio, 2),
+            "taker_ratio": taker_buy_ratio,
             "stop_loss": round(stop_loss, 4),
             "take_profit": round(take_profit, 4)
         }
@@ -252,7 +279,7 @@ def format_signal_message(longs, shorts):
     if not longs and not shorts:
         return "❌ Качественных сетапов с Quality Score >= 70 на данный момент не найдено."
 
-    text = "📊 *РЕЗУЛЬТАТЫ СКАНРИРОВАНИЯ (TREND-PULLBACK)*\n\n"
+    text = "📊 *РЕЗУЛЬТАТЫ СКАНРИРОВАНИЯ (NEXUS 5M)*\n\n"
 
     if longs:
         text += f"🟢 *TOP-{len(longs)} LONG СЕТАПЫ:*\n"
@@ -260,7 +287,7 @@ def format_signal_message(longs, shorts):
             text += (
                 f"• *{s['symbol']}* | Score: *{s['score']}*\n"
                 f"  Вход: `{s['price']}` | SL: `{s['stop_loss']}` | TP: `{s['take_profit']}`\n"
-                f"  Vol Ratio: `{s['vol_ratio']}x` | RSI: `{s['rsi']}`\n\n"
+                f"  Vol Ratio: `{s['vol_ratio']}x` | Taker Buy: `{s['taker_ratio']*100}%` | RSI: `{s['rsi']}`\n\n"
             )
 
     if shorts:
@@ -269,7 +296,7 @@ def format_signal_message(longs, shorts):
             text += (
                 f"• *{s['symbol']}* | Score: *{s['score']}*\n"
                 f"  Вход: `{s['price']}` | SL: `{s['stop_loss']}` | TP: `{s['take_profit']}`\n"
-                f"  Vol Ratio: `{s['vol_ratio']}x` | RSI: `{s['rsi']}`\n\n"
+                f"  Vol Ratio: `{s['vol_ratio']}x` | Taker Buy: `{s['taker_ratio']*100}%` | RSI: `{s['rsi']}`\n\n"
             )
 
     return text
@@ -284,32 +311,39 @@ def get_scan_keyboard():
     )
 
 async def auto_scan_job():
-    """Фоновая задача авто-сканирования (работает, только если AUTO_SCAN_ENABLED == True)."""
+    """Синхронизированный 5-минутный цикличный сканер (каждые :00, :05, :10... минут + 3 секунды)."""
     while True:
         try:
-            await asyncio.sleep(900)  # 15 минут
-            
+            now = datetime.utcnow()
+            # Считаем сколько секунд осталось до следующей 5-минутки (:00, :05, :10...) + 3 сек запаса
+            next_minute = (now.minute // 5 + 1) * 5
+            if next_minute == 60:
+                sleep_seconds = (60 - now.minute - 1) * 60 + (60 - now.second) + 3
+            else:
+                sleep_seconds = (next_minute - now.minute - 1) * 60 + (60 - now.second) + 3
+
+            await asyncio.sleep(sleep_seconds)
+
             if not AUTO_SCAN_ENABLED:
-                logger.info("⏸️ Авто-сканер выключен пользователем. Пропуск цикла.")
                 continue
 
-            logger.info("⏰ Запуск автоматического 15-минутного сканирования...")
+            logger.info("⏰ Запуск точного 5-минутного сканирования закрытия свечи...")
             longs, shorts = await run_market_scan()
 
-            now = time.time()
+            current_ts = time.time()
             for sym, ts in list(SENT_SIGNALS_CACHE.items()):
-                if now - ts > CACHE_TTL:
+                if current_ts - ts > CACHE_TTL:
                     del SENT_SIGNALS_CACHE[sym]
 
             new_longs = [s for s in longs if s["symbol"] not in SENT_SIGNALS_CACHE]
             new_shorts = [s for s in shorts if s["symbol"] not in SENT_SIGNALS_CACHE]
 
             if (new_longs or new_shorts) and CHAT_ID:
-                msg_text = "🚨 *АВТО-СИГНАЛ СКРИНЕРА (15M)* 🚨\n\n" + format_signal_message(new_longs, new_shorts)
+                msg_text = "🚨 *АВТО-СИГНАЛ СКРИНЕРА (5M)* 🚨\n\n" + format_signal_message(new_longs, new_shorts)
                 await bot.send_message(chat_id=CHAT_ID, text=msg_text, parse_mode="Markdown", reply_markup=get_scan_keyboard())
                 
                 for s in new_longs + new_shorts:
-                    SENT_SIGNALS_CACHE[s["symbol"]] = now
+                    SENT_SIGNALS_CACHE[s["symbol"]] = current_ts
 
         except Exception as e:
             logger.error(f"Ошибка в авто-сканировании: {e}")
@@ -318,10 +352,10 @@ async def auto_scan_job():
 async def cmd_start(message: types.Message):
     global CHAT_ID
     CHAT_ID = message.chat.id
-    status = "включено 🟢" if AUTO_SCAN_ENABLED else "выключено 🔴"
+    status = "включено 🟢 (5M Sync)" if AUTO_SCAN_ENABLED else "выключено 🔴"
     await message.answer(
-        f"👋 Привет! Я торговый скринер Binance Futures.\n\n"
-        f"Статус авто-сканирования каждые 15 минут: **{status}**.\n"
+        f"👋 Привет! Я торговый скринер Binance Futures (NEXUS Engine).\n\n"
+        f"Статус авто-сканирования (каждые 5 минут): **{status}**.\n"
         f"Используйте кнопки ниже для управления:",
         parse_mode="Markdown",
         reply_markup=get_scan_keyboard()
@@ -346,9 +380,8 @@ async def callback_toggle_auto_scan(callback_query: CallbackQuery):
     CHAT_ID = callback_query.message.chat.id
     AUTO_SCAN_ENABLED = not AUTO_SCAN_ENABLED
     
-    status_text = "🟢 Авто-сканирование ВКЛЮЧЕНО (каждые 15 минут)" if AUTO_SCAN_ENABLED else "🔴 Авто-сканирование ВЫКЛЮЧЕНО"
+    status_text = "🟢 5M Авто-сканирование ВКЛЮЧЕНО" if AUTO_SCAN_ENABLED else "🔴 Авто-сканирование ВЫКЛЮЧЕНО"
     await callback_query.answer(status_text)
-    
     await callback_query.message.edit_reply_markup(reply_markup=get_scan_keyboard())
 
 async def execute_scan_and_send(chat_id: int):
@@ -378,7 +411,7 @@ async def main():
     
     asyncio.create_task(auto_scan_job())
     
-    logger.info("🤖 Бот запущен с переключателем авто-сканирования!")
+    logger.info("🤖 Бот запущен в режиме точного 5-минутного сканирования!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
