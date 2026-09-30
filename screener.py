@@ -26,6 +26,12 @@ BINANCE_BASE_URL = "https://fapi.binance.com"
 DB_PATH = "nexus_screener.db"
 STRATEGY_VERSION = "TPB_v1.1"
 
+# Заголовки для обхода фильтрации ботов на Binance API
+BINANCE_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "application/json"
+}
+
 SENT_SIGNALS_CACHE = {}
 CACHE_TTL = 2 * 3600  # 2 часа задержки перед повторным сигналом
 
@@ -44,7 +50,6 @@ def init_db():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
 
-    # 1. Таблица сканов (для диагностики воронки)
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS scans (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -61,7 +66,6 @@ def init_db():
     );
     """)
 
-    # 2. Таблица сетапов/кандидатов
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS setups (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -84,7 +88,6 @@ def init_db():
     );
     """)
 
-    # 3. Таблица исходов сделок (для расчета Net R)
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS outcomes (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -109,7 +112,6 @@ def save_scan_and_setups(funnel, candidates, duration_ms):
         cursor = conn.cursor()
         now_iso = datetime.utcnow().isoformat()
 
-        # Запись скана
         cursor.execute("""
         INSERT INTO scans (ts, universe_count, volume_pass, btc_pass, trend_pass, pullback_pass, rsi_pass, breakout_pass, signal_pass, duration_ms)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -127,7 +129,6 @@ def save_scan_and_setups(funnel, candidates, duration_ms):
         ))
         scan_id = cursor.lastrowid
 
-        # Запись кандидатов и сигналов
         for c in candidates:
             status = "SIGNAL" if c["score"] >= 70 else "CANDIDATE"
             cursor.execute("""
@@ -220,32 +221,43 @@ def calculate_atr(klines, period=14):
 
 
 # ==========================================
-# 4. ПОЛУЧЕНИЕ ДАННЫХ И АНАЛИЗ (NEXUS ENGINE)
+# 4. ПОЛУЧЕНИЕ ДАННЫХ И АНАЛИЗ (С РЕТАЯМИ)
 # ==========================================
 async def fetch_klines(session, symbol, interval, limit=100):
     url = f"{BINANCE_BASE_URL}/fapi/v1/klines"
     params = {"symbol": symbol, "interval": interval, "limit": limit}
-    try:
-        async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-            if resp.status == 200:
-                return await resp.json()
-    except Exception as e:
-        logger.error(f"Ошибка получения klines для {symbol} ({interval}): {e}")
+    for attempt in range(3):
+        try:
+            async with session.get(url, params=params, headers=BINANCE_HEADERS, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+                elif resp.status == 418:
+                    logger.warning(f"Binance 418 IP block для {symbol}. Пауза...")
+                    await asyncio.sleep(5)
+                else:
+                    logger.warning(f"Binance API status {resp.status} for {symbol}")
+        except Exception as e:
+            if attempt == 2:
+                logger.error(f"Ошибка получения klines для {symbol} ({interval}) после 3 попыток: {e}")
+            await asyncio.sleep(2)
     return None
 
 async def get_futures_symbols(session):
     url = f"{BINANCE_BASE_URL}/fapi/v1/ticker/24hr"
-    try:
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-            if resp.status == 200:
-                tickers = await resp.json()
-                symbols = [
-                    t["symbol"] for t in tickers 
-                    if t["symbol"].endswith("USDT") and float(t.get("quoteVolume", 0)) >= 15_000_000
-                ]
-                return symbols
-    except Exception as e:
-        logger.error(f"Ошибка получения тикеров: {e}")
+    for attempt in range(3):
+        try:
+            async with session.get(url, headers=BINANCE_HEADERS, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                if resp.status == 200:
+                    tickers = await resp.json()
+                    symbols = [
+                        t["symbol"] for t in tickers 
+                        if t["symbol"].endswith("USDT") and float(t.get("quoteVolume", 0)) >= 15_000_000
+                    ]
+                    return symbols
+        except Exception as e:
+            if attempt == 2:
+                logger.error(f"Ошибка получения тикеров после 3 попыток: {e}")
+            await asyncio.sleep(2)
     return []
 
 async def analyze_symbol(session, symbol, btc_trend):
@@ -384,7 +396,7 @@ async def run_market_scan():
             if not symbols:
                 return [], []
 
-            funnel["universe"] = 300 # примерный объем рынка
+            funnel["universe"] = 300
             funnel["volume"] = len(symbols)
             funnel["btc"] = len(symbols)
 
@@ -421,16 +433,13 @@ async def run_market_scan():
             funnel["signals"] = len(longs) + len(shorts)
             duration_ms = int((time.time() - start_time) * 1000)
 
-            # Сохранение в БД SQLite
             save_scan_and_setups(funnel, candidates, duration_ms)
 
-            # Вывод лаконичного лога в консоль
             logger.info(
                 f"[SCAN FUNNEL] 300→{funnel['volume']}→{funnel['trend']}→{funnel['pullback']}→{funnel['rsi']}→{funnel['breakout']} | "
                 f"SIGNALS: {funnel['signals']} | {duration_ms}ms"
             )
 
-            # Агрегация часовой статистики
             HOURLY_FUNNEL_STATS.append(funnel)
             if len(HOURLY_FUNNEL_STATS) >= 12:
                 log_hourly_funnel_summary()
@@ -593,7 +602,6 @@ async def main():
         logger.error("Бот не инициализирован. Проверьте TELEGRAM_BOT_TOKEN.")
         return
     
-    # Инициализация базы данных SQLite
     init_db()
 
     await start_health_check_server()
