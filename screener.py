@@ -35,8 +35,8 @@ def init_db():
     logging.info("📁 База данных SQLite успешно инициализирована.")
 
 async def fetch_binance_futures():
-    """Асинхронный запрос к публичному API Binance Futures для получения цен"""
-    url = "https://fapi.binance.com/fapi/v1/ticker/24hr"
+    """Асинхронный запрос к публичному API Binance через зеркало для обхода ограничений дата-центров"""
+    url = "https://data-api.binance.vision/api/v3/ticker/24hr"
     async with aiohttp.ClientSession() as session:
         try:
             async with session.get(url, timeout=10) as response:
@@ -52,15 +52,13 @@ async def fetch_binance_futures():
 
 async def analyze_market(tickers):
     """Логика сканирования и отбора топ-монет по волатильности"""
-    signals = []
-    
     valid_tickers = [t for t in tickers if t.get('symbol', '').endswith('USDT')]
     valid_tickers.sort(key=lambda x: float(x.get('priceChangePercent', 0)), reverse=True)
     
     top_gainers = valid_tickers[:3]
     
     report_lines = ["🚀 *NEXUS Screener: 5-Min Report*\n"]
-    report_lines.append("📊 *Топ движения на Binance Futures:*")
+    report_lines.append("📊 *Топ движения на Binance:*")
     
     for item in top_gainers:
         symbol = item.get('symbol')
