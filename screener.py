@@ -23,7 +23,10 @@ dp = Dispatcher()
 BINANCE_BASE_URL = "https://fapi.binance.com"
 
 SENT_SIGNALS_CACHE = {}
-CACHE_TTL = 2 * 3600  # 2 часа задержка перед повторным сигналом по той же монете
+CACHE_TTL = 2 * 3600  # 2 часа задержка перед повторным сигналом
+
+# Переменная состояния авто-сканера (по умолчанию включен)
+AUTO_SCAN_ENABLED = True
 
 
 # ==========================================
@@ -243,7 +246,7 @@ async def run_market_scan():
 
 
 # ==========================================
-# 4. ФОРМАТИРОВАНИЕ СООБЩЕНИЙ И ОБРАБОТЧИКИ
+# 4. КНОПКИ И ОБРАБОТЧИКИ ТЕЛЕГРАМ
 # ==========================================
 def format_signal_message(longs, shorts):
     if not longs and not shorts:
@@ -272,17 +275,24 @@ def format_signal_message(longs, shorts):
     return text
 
 def get_scan_keyboard():
+    toggle_text = "🔴 Выключить авто-сканер" if AUTO_SCAN_ENABLED else "🟢 Включить авто-сканер"
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="🔍 Запустить сканер", callback_data="run_scan")]
+            [InlineKeyboardButton(text="🔍 Запустить сканер", callback_data="run_scan")],
+            [InlineKeyboardButton(text=toggle_text, callback_data="toggle_auto_scan")]
         ]
     )
 
 async def auto_scan_job():
-    """Фоновая задача: авто-сканирование каждые 15 минут."""
+    """Фоновая задача авто-сканирования (работает, только если AUTO_SCAN_ENABLED == True)."""
     while True:
         try:
             await asyncio.sleep(900)  # 15 минут
+            
+            if not AUTO_SCAN_ENABLED:
+                logger.info("⏸️ Авто-сканер выключен пользователем. Пропуск цикла.")
+                continue
+
             logger.info("⏰ Запуск автоматического 15-минутного сканирования...")
             longs, shorts = await run_market_scan()
 
@@ -308,10 +318,12 @@ async def auto_scan_job():
 async def cmd_start(message: types.Message):
     global CHAT_ID
     CHAT_ID = message.chat.id
+    status = "включено 🟢" if AUTO_SCAN_ENABLED else "выключено 🔴"
     await message.answer(
-        "👋 Привет! Я торговый скринер Binance Futures.\n\n"
-        "Я автоматически сканирую рынок каждые 15 минут и присылаю сигналы при появлении качественных сетапов.\n"
-        "Вы также можете запустить сканирование вручную:",
+        f"👋 Привет! Я торговый скринер Binance Futures.\n\n"
+        f"Статус авто-сканирования каждые 15 минут: **{status}**.\n"
+        f"Используйте кнопки ниже для управления:",
+        parse_mode="Markdown",
         reply_markup=get_scan_keyboard()
     )
 
@@ -327,6 +339,17 @@ async def callback_scan(callback_query: CallbackQuery):
     CHAT_ID = callback_query.message.chat.id
     await callback_query.answer("Запуск сканирования рынка...")
     await execute_scan_and_send(callback_query.message.chat.id)
+
+@dp.callback_query(lambda c: c.data == "toggle_auto_scan")
+async def callback_toggle_auto_scan(callback_query: CallbackQuery):
+    global AUTO_SCAN_ENABLED, CHAT_ID
+    CHAT_ID = callback_query.message.chat.id
+    AUTO_SCAN_ENABLED = not AUTO_SCAN_ENABLED
+    
+    status_text = "🟢 Авто-сканирование ВКЛЮЧЕНО (каждые 15 минут)" if AUTO_SCAN_ENABLED else "🔴 Авто-сканирование ВЫКЛЮЧЕНО"
+    await callback_query.answer(status_text)
+    
+    await callback_query.message.edit_reply_markup(reply_markup=get_scan_keyboard())
 
 async def execute_scan_and_send(chat_id: int):
     status_msg = await bot.send_message(chat_id, "⏳ Сканирую рынки Binance USDT-M Futures (1H / 15M / 5M)...")
@@ -355,7 +378,7 @@ async def main():
     
     asyncio.create_task(auto_scan_job())
     
-    logger.info("🤖 Бот запущен с функцией 15-минутного авто-сканирования!")
+    logger.info("🤖 Бот запущен с переключателем авто-сканирования!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
