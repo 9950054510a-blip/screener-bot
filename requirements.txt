@@ -19,3 +19,5 @@ six==1.17.0
 tqdm==4.70.1
 typing_extensions==4.16.0
 yarl==1.25.1
+aiogram
+pandas
